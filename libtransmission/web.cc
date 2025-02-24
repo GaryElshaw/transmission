@@ -129,7 +129,7 @@ CURLcode ssl_context_func(CURL* /*curl*/, void* ssl_ctx, void* /*user_data*/)
 
     for (auto& sys_store_name : SysStoreNames)
     {
-        HCERTSTORE const sys_cert_store = CertOpenSystemStoreW(0, sys_store_name);
+        auto* const sys_cert_store = CertOpenSystemStoreW(0, sys_store_name);
         if (sys_cert_store == nullptr)
         {
             continue;
@@ -145,7 +145,7 @@ CURLcode ssl_context_func(CURL* /*curl*/, void* ssl_ctx, void* /*user_data*/)
                 break;
             }
 
-            tr_x509_cert_t const cert = tr_x509_cert_new(sys_cert->pbCertEncoded, sys_cert->cbCertEncoded);
+            auto* const cert = tr_x509_cert_new(sys_cert->pbCertEncoded, sys_cert->cbCertEncoded);
             if (cert == nullptr)
             {
                 continue;
@@ -386,6 +386,13 @@ public:
         CURL* easy_;
     };
 
+    // https://github.com/curl/curl/issues/10936
+    [[nodiscard]] static bool check_curl_gh10936() noexcept
+    {
+        auto const version = curl_version_info(CURLVERSION_NOW)->version_num;
+        return version >= 0x075700 /* 7.87.0 */ && version <= 0x080500 /* 8.5.0 */;
+    }
+
     static auto constexpr BandwidthPauseMsec = long{ 500 };
     static auto constexpr DnsCacheTimeoutSecs = long{ 60 * 60 };
     static auto constexpr MaxRedirects = long{ 10 };
@@ -393,6 +400,7 @@ public:
     bool const curl_verbose = tr_env_key_exists("TR_CURL_VERBOSE");
     bool const curl_ssl_verify = !tr_env_key_exists("TR_CURL_SSL_NO_VERIFY");
     bool const curl_proxy_ssl_verify = !tr_env_key_exists("TR_CURL_PROXY_SSL_NO_VERIFY");
+    bool const curl_gh10936 = check_curl_gh10936();
 
     Mediator& mediator;
 
@@ -406,7 +414,7 @@ public:
     // if unset: steady-state, all is good
     // if set: do not accept new tasks
     // if set and deadline reached: kill all remaining tasks
-    std::atomic<time_t> deadline_ = {};
+    std::atomic<time_t> deadline_ = {}; // NOLINT(readability-redundant-member-init)
 
     [[nodiscard]] auto deadline() const
     {
@@ -482,8 +490,6 @@ public:
                 task->impl.paused_easy_handles.emplace(task->easy(), tr_time_msec());
                 return CURL_WRITEFUNC_PAUSE;
             }
-
-            task->impl.mediator.notifyBandwidthConsumed(*tag, bytes_used);
         }
 
         evbuffer_add(task->body(), data, bytes_used);
@@ -524,7 +530,7 @@ public:
         (void)curl_easy_setopt(e, CURLOPT_AUTOREFERER, 1L);
         (void)curl_easy_setopt(e, CURLOPT_ACCEPT_ENCODING, "");
         (void)curl_easy_setopt(e, CURLOPT_FOLLOWLOCATION, 1L);
-        (void)curl_easy_setopt(e, CURLOPT_MAXREDIRS, -1L);
+        (void)curl_easy_setopt(e, CURLOPT_MAXREDIRS, MaxRedirects);
         (void)curl_easy_setopt(e, CURLOPT_NOSIGNAL, 1L);
         (void)curl_easy_setopt(e, CURLOPT_PRIVATE, &task);
         (void)curl_easy_setopt(e, CURLOPT_IPRESOLVE, task.ipProtocol());
@@ -578,7 +584,6 @@ public:
         (void)curl_easy_setopt(e, CURLOPT_VERBOSE, curl_verbose ? 1L : 0L);
         (void)curl_easy_setopt(e, CURLOPT_WRITEDATA, &task);
         (void)curl_easy_setopt(e, CURLOPT_WRITEFUNCTION, &tr_web::Impl::onDataReceived);
-        (void)curl_easy_setopt(e, CURLOPT_MAXREDIRS, MaxRedirects);
 
         if (auto const addrstr = task.bind_address(); addrstr)
         {
@@ -601,6 +606,11 @@ public:
             (void)curl_easy_setopt(e, CURLOPT_ACCEPT_ENCODING, "identity");
             (void)curl_easy_setopt(e, CURLOPT_HTTP_CONTENT_DECODING, 0L);
             (void)curl_easy_setopt(e, CURLOPT_RANGE, range->c_str());
+        }
+
+        if (curl_gh10936)
+        {
+            (void)curl_easy_setopt(e, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
         }
     }
 

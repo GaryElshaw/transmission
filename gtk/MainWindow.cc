@@ -93,9 +93,11 @@ public:
         Glib::RefPtr<Gtk::Builder> const& builder,
         Glib::RefPtr<Gio::ActionGroup> const& actions,
         Glib::RefPtr<Session> const& core);
+    Impl(Impl&&) = delete;
+    Impl(Impl const&) = delete;
+    Impl& operator=(Impl&&) = delete;
+    Impl& operator=(Impl const&) = delete;
     ~Impl();
-
-    TR_DISABLE_COPY_MOVE(Impl)
 
     [[nodiscard]] Glib::RefPtr<TorrentViewSelection> get_selection() const;
 
@@ -887,7 +889,7 @@ void MainWindow::set_busy(bool isBusy)
     if (get_realized())
     {
 #if GTKMM_CHECK_VERSION(4, 0, 0)
-        auto const cursor = isBusy ? Gdk::Cursor::create("wait") : Glib::RefPtr<Gdk::Cursor>();
+        auto const cursor = isBusy ? Gdk::Cursor::create(Glib::ustring("wait")) : Glib::RefPtr<Gdk::Cursor>();
         set_cursor(cursor);
 #else
         auto const display = get_display();

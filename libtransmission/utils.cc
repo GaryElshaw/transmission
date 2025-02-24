@@ -32,6 +32,7 @@
 #include <shellapi.h> /* CommandLineToArgv() */
 #else
 #include <arpa/inet.h>
+#include <sys/stat.h> /* umask() */
 #endif
 
 #define UTF_CPP_CPLUSPLUS 201703L
@@ -75,21 +76,32 @@ Config::Units<StorageUnits> Config::Storage{ Config::Base::Kilo, "B"sv, "kB"sv, 
 
 // ---
 
+#if defined(_WIN32) && defined(__clang_analyzer__)
+// See https://github.com/llvm/llvm-project/issues/44701
+#define WORKAROUND_CLANG_TIDY_GH44701
+#endif
+
 std::optional<std::locale> tr_locale_set_global(char const* locale_name) noexcept
 {
+#ifndef WORKAROUND_CLANG_TIDY_GH44701
     try
+#endif
     {
         return tr_locale_set_global(std::locale{ locale_name });
     }
+#ifndef WORKAROUND_CLANG_TIDY_GH44701
     catch (std::runtime_error const&)
     {
         return {};
     }
+#endif
 }
 
 std::optional<std::locale> tr_locale_set_global(std::locale const& locale) noexcept
 {
+#ifndef WORKAROUND_CLANG_TIDY_GH44701
     try
+#endif
     {
         auto old_locale = std::locale::global(locale);
 
@@ -98,10 +110,12 @@ std::optional<std::locale> tr_locale_set_global(std::locale const& locale) noexc
 
         return old_locale;
     }
+#ifndef WORKAROUND_CLANG_TIDY_GH44701
     catch (std::exception const&)
     {
         return {};
     }
+#endif
 }
 
 // ---
@@ -180,6 +194,14 @@ bool tr_file_save(std::string_view filename, std::string_view contents, tr_error
     {
         return false;
     }
+#ifndef _WIN32
+    // set file mode per settings umask()
+    {
+        auto const val = ::umask(0);
+        ::umask(val);
+        fchmod(fd, 0666 & ~val);
+    }
+#endif
 
     // Save the contents. This might take >1 pass.
     auto ok = true;
@@ -336,7 +358,7 @@ std::string tr_win32_format_message(uint32_t code)
         nullptr,
         code,
         0,
-        (LPWSTR)&wide_text,
+        reinterpret_cast<LPWSTR>(&wide_text),
         0,
         nullptr);
 
@@ -355,7 +377,7 @@ std::string tr_win32_format_message(uint32_t code)
     LocalFree(wide_text);
 
     // Most (all?) messages contain "\r\n" in the end, chop it
-    while (!std::empty(text) && isspace(text.back()))
+    while (!std::empty(text) && isspace(text.back()) != 0)
     {
         text.resize(text.size() - 1);
     }
@@ -370,7 +392,7 @@ namespace tr_main_win32_impl
 
 std::optional<std::vector<std::string>> win32MakeUtf8Argv()
 {
-    int argc;
+    int argc = 0;
     auto argv = std::vector<std::string>{};
     if (wchar_t** wargv = CommandLineToArgvW(GetCommandLineW(), &argc); wargv != nullptr)
     {
@@ -390,7 +412,7 @@ std::optional<std::vector<std::string>> win32MakeUtf8Argv()
             argv.emplace_back(std::move(str));
         }
 
-        LocalFree(wargv);
+        LocalFree(reinterpret_cast<HLOCAL>(wargv));
     }
 
     if (static_cast<int>(std::size(argv)) == argc)
@@ -539,7 +561,7 @@ std::string tr_strpercent(double x)
     return fmt::format("{:.0Lf}", x);
 }
 
-std::string tr_strratio(double ratio, char const* infinity)
+std::string tr_strratio(double ratio, std::string_view infinity)
 {
     if ((int)ratio == TR_RATIO_NA)
     {
@@ -548,7 +570,7 @@ std::string tr_strratio(double ratio, char const* infinity)
 
     if ((int)ratio == TR_RATIO_INF)
     {
-        return infinity != nullptr ? infinity : "";
+        return std::string{ infinity };
     }
 
     return tr_strpercent(ratio);
@@ -556,7 +578,7 @@ std::string tr_strratio(double ratio, char const* infinity)
 
 // ---
 
-bool tr_file_move(std::string_view oldpath_in, std::string_view newpath_in, tr_error* error)
+bool tr_file_move(std::string_view oldpath_in, std::string_view newpath_in, bool allow_copy, tr_error* error)
 {
     auto const oldpath = tr_pathbuf{ oldpath_in };
     auto const newpath = tr_pathbuf{ newpath_in };
@@ -581,7 +603,7 @@ bool tr_file_move(std::string_view oldpath_in, std::string_view newpath_in, tr_e
     }
 
     // ensure the target directory exists
-    auto newdir = tr_pathbuf{ newpath.sv() };
+    auto newdir = tr_pathbuf{ newpath };
     newdir.popdir();
     if (!tr_sys_dir_create(newdir, TR_SYS_DIR_CREATE_PARENTS, 0777, error))
     {
@@ -590,9 +612,15 @@ bool tr_file_move(std::string_view oldpath_in, std::string_view newpath_in, tr_e
     }
 
     /* they might be on the same filesystem... */
-    if (tr_sys_path_rename(oldpath, newpath))
+    if (tr_sys_path_rename(oldpath, newpath, error))
     {
         return true;
+    }
+
+    if (!allow_copy)
+    {
+        error->prefix_message("Unable to move file: ");
+        return false;
     }
 
     /* Otherwise, copy the file. */
@@ -705,36 +733,50 @@ std::string tr_env_get_string(std::string_view key, std::string_view default_val
 
 // ---
 
-tr_net_init_mgr::tr_net_init_mgr()
+namespace
 {
-    // try to init curl with default settings (currently ssl support + win32 sockets)
-    // but if that fails, we need to init win32 sockets as a bare minimum
-    if (curl_global_init(CURL_GLOBAL_ALL) != CURLE_OK)
+namespace tr_net_init_impl
+{
+class tr_net_init_mgr
+{
+private:
+    tr_net_init_mgr()
     {
-        curl_global_init(CURL_GLOBAL_WIN32);
+        // try to init curl with default settings (currently ssl support + win32 sockets)
+        // but if that fails, we need to init win32 sockets as a bare minimum
+        if (curl_global_init(CURL_GLOBAL_ALL) != CURLE_OK)
+        {
+            curl_global_init(CURL_GLOBAL_WIN32);
+        }
     }
-}
 
-tr_net_init_mgr::~tr_net_init_mgr()
-{
-    curl_global_cleanup();
-}
-
-std::unique_ptr<tr_net_init_mgr> tr_net_init_mgr::create()
-{
-    if (!initialised)
+public:
+    tr_net_init_mgr(tr_net_init_mgr const&) = delete;
+    tr_net_init_mgr(tr_net_init_mgr&&) = delete;
+    tr_net_init_mgr& operator=(tr_net_init_mgr const&) = delete;
+    tr_net_init_mgr& operator=(tr_net_init_mgr&&) = delete;
+    ~tr_net_init_mgr()
     {
-        initialised = true;
-        return std::unique_ptr<tr_net_init_mgr>{ new tr_net_init_mgr };
+        curl_global_cleanup();
     }
-    return {};
-}
 
-bool tr_net_init_mgr::initialised = false;
+    static void create()
+    {
+        if (!instance)
+        {
+            instance = std::unique_ptr<tr_net_init_mgr>{ new tr_net_init_mgr };
+        }
+    }
 
-std::unique_ptr<tr_net_init_mgr> tr_lib_init()
+private:
+    static inline std::unique_ptr<tr_net_init_mgr> instance;
+};
+} // namespace tr_net_init_impl
+} // namespace
+
+void tr_lib_init()
 {
-    return tr_net_init_mgr::create();
+    tr_net_init_impl::tr_net_init_mgr::create();
 }
 
 // --- mime-type

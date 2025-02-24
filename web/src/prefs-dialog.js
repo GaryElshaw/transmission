@@ -15,7 +15,7 @@ import {
 export class PrefsDialog extends EventTarget {
   static _initTimeDropDown(e) {
     for (let index = 0; index < 24 * 4; ++index) {
-      const hour = Number.parseInt(index / 4, 10);
+      const hour = index / 4;
       const mins = (index % 4) * 15;
       const value = index * 15;
       const content = `${hour}:${mins || '00'}`;
@@ -170,6 +170,8 @@ export class PrefsDialog extends EventTarget {
               break;
           }
         }
+
+        element.dispatchEvent(new Event('session-change'));
       }
     }
   }
@@ -203,7 +205,7 @@ export class PrefsDialog extends EventTarget {
         element.classList.toggle('disabled', !check.checked);
       }
     };
-    check.addEventListener('change', callback);
+    check.addEventListener('session-change', callback);
     callback();
   }
 
@@ -856,7 +858,7 @@ export class PrefsDialog extends EventTarget {
         this.update_from_session,
       );
       this.elements.root.remove();
-      dispatchEvent(new Event('close'));
+      this.dispatchEvent(new Event('close'));
       for (const key of Object.keys(this)) {
         this[key] = null;
       }

@@ -63,10 +63,11 @@ public:
         }
     };
 
-    enum class ChangeReason
+    enum class ChangeReason : uint8_t
     {
         User,
-        Scheduler
+        Scheduler,
+        LoadSettings
     };
 
     class Mediator
@@ -162,7 +163,10 @@ public:
         }
     }
 
-    void set_active(bool active, ChangeReason reason);
+    void set_active(bool active, ChangeReason reason)
+    {
+        set_active(active, reason, false);
+    }
 
 private:
     Mediator& mediator_;
@@ -171,6 +175,7 @@ private:
 
     void update_scheduler();
     void update_minutes();
+    void set_active(bool active, ChangeReason reason, bool force);
 
     // whether `time` hits in one of the `minutes_` that is true
     [[nodiscard]] bool is_active_minute(time_t time) const noexcept;
@@ -182,7 +187,7 @@ private:
     // bitfield of all the minutes in a week.
     // Each bit's value indicates whether the scheduler wants
     // alt speeds on or off at that given minute.
-    std::bitset<10080> minutes_{};
+    std::bitset<10080> minutes_;
 
     // recent change that was made by the scheduler
     std::optional<bool> scheduler_set_is_active_to_;

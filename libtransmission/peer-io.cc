@@ -85,12 +85,12 @@ tr_peerIo::tr_peerIo(
     tr_session* session,
     tr_sha1_digest_t const* info_hash,
     bool is_incoming,
-    bool is_seed,
+    bool client_is_seed,
     tr_bandwidth* parent_bandwidth)
     : bandwidth_{ parent_bandwidth }
     , info_hash_{ info_hash != nullptr ? *info_hash : tr_sha1_digest_t{} }
     , session_{ session }
-    , is_seed_{ is_seed }
+    , client_is_seed_{ client_is_seed }
     , is_incoming_{ is_incoming }
 {
 }
@@ -125,7 +125,7 @@ std::shared_ptr<tr_peerIo> tr_peerIo::new_outgoing(
     tr_bandwidth* parent,
     tr_socket_address const& socket_address,
     tr_sha1_digest_t const& info_hash,
-    bool is_seed,
+    bool client_is_seed,
     bool utp)
 {
     using preferred_key_t = std::underlying_type_t<tr_preferred_transport>;
@@ -136,7 +136,7 @@ std::shared_ptr<tr_peerIo> tr_peerIo::new_outgoing(
     TR_ASSERT(socket_address.is_valid());
     TR_ASSERT(utp || session->allowsTCP());
 
-    auto peer_io = tr_peerIo::create(session, parent, &info_hash, false, is_seed);
+    auto peer_io = tr_peerIo::create(session, parent, &info_hash, false, client_is_seed);
     auto const func = small::max_size_map<preferred_key_t, std::function<bool()>, TR_NUM_PREFERRED_TRANSPORT>{
         { TR_PREFER_UTP,
           [&]()
@@ -162,7 +162,7 @@ std::shared_ptr<tr_peerIo> tr_peerIo::new_outgoing(
           {
               if (!peer_io->socket_.is_valid())
               {
-                  if (auto sock = tr_netOpenPeerSocket(session, socket_address, is_seed); sock.is_valid())
+                  if (auto sock = tr_netOpenPeerSocket(session, socket_address, client_is_seed); sock.is_valid())
                   {
                       peer_io->set_socket(std::move(sock));
                       return true;
@@ -229,6 +229,11 @@ void tr_peerIo::close()
     socket_.close();
     event_write_.reset();
     event_read_.reset();
+    inbuf_.clear();
+    outbuf_.clear();
+    outbuf_info_.clear();
+    encrypt_disable();
+    decrypt_disable();
 }
 
 void tr_peerIo::clear()
@@ -241,28 +246,20 @@ void tr_peerIo::clear()
 
 bool tr_peerIo::reconnect()
 {
-    TR_ASSERT(!this->is_incoming());
-    TR_ASSERT(this->session_->allowsTCP());
+    TR_ASSERT(!is_incoming());
+    TR_ASSERT(session_->allowsTCP());
 
-    short int const pending_events = this->pending_events_;
+    auto const pending_events = pending_events_;
     event_disable(EV_READ | EV_WRITE);
 
     close();
 
-    if (tr_peer_socket::limit_reached(session_))
-    {
-        return false;
-    }
-
-    auto sock = tr_netOpenPeerSocket(session_, socket_address(), is_seed());
+    auto sock = tr_netOpenPeerSocket(session_, socket_address(), client_is_seed());
     if (!sock.is_tcp())
     {
         return false;
     }
-    socket_ = std::move(sock);
-
-    this->event_read_.reset(event_new(session_->event_base(), socket_.handle.tcp, EV_READ, event_read_cb, this));
-    this->event_write_.reset(event_new(session_->event_base(), socket_.handle.tcp, EV_WRITE, event_write_cb, this));
+    set_socket(std::move(sock));
 
     event_enable(pending_events);
 
@@ -274,21 +271,21 @@ bool tr_peerIo::reconnect()
 void tr_peerIo::did_write_wrapper(size_t bytes_transferred)
 {
     auto const keep_alive = shared_from_this();
+    auto const now = tr_time_msec();
 
-    while (bytes_transferred != 0U && !std::empty(outbuf_info_))
+    if (bytes_transferred > 0U)
+    {
+        bandwidth().notify_bandwidth_consumed(TR_UP, bytes_transferred, false, now);
+    }
+
+    while (bytes_transferred > 0U && !std::empty(outbuf_info_))
     {
         auto& [n_bytes_left, is_piece_data] = outbuf_info_.front();
+        auto const payload = std::min(n_bytes_left, bytes_transferred);
 
-        size_t const payload = std::min(uint64_t{ n_bytes_left }, uint64_t{ bytes_transferred });
-        /* For µTP sockets, the overhead is computed in utp_on_overhead. */
-        size_t const overhead = socket_.guess_packet_overhead(payload);
-        uint64_t const now = tr_time_msec();
-
-        bandwidth().notify_bandwidth_consumed(TR_UP, payload, is_piece_data, now);
-
-        if (overhead > 0U)
+        if (is_piece_data)
         {
-            bandwidth().notify_bandwidth_consumed(TR_UP, overhead, false, now);
+            bandwidth().notify_bandwidth_consumed(TR_UP, payload, true, now);
         }
 
         if (did_write_ != nullptr)
@@ -363,7 +360,7 @@ void tr_peerIo::event_write_cb([[maybe_unused]] evutil_socket_t fd, short /*even
 
 // ---
 
-void tr_peerIo::can_read_wrapper()
+void tr_peerIo::can_read_wrapper(size_t bytes_transferred)
 {
     // try to consume the input buffer
 
@@ -379,6 +376,11 @@ void tr_peerIo::can_read_wrapper()
     auto done = false;
     auto err = false;
 
+    if (bytes_transferred > 0U)
+    {
+        bandwidth().notify_bandwidth_consumed(TR_DOWN, bytes_transferred, false, now);
+    }
+
     // In normal conditions, only continue processing if we still have bandwidth
     // quota for it.
     //
@@ -387,43 +389,29 @@ void tr_peerIo::can_read_wrapper()
     // processing if the read buffer is more than twice as large as the target size.
     while (!done && !err && (read_buffer_size() > RcvBuf * 2U || bandwidth().clamp(TR_DOWN, read_buffer_size()) != 0U))
     {
-        size_t piece = 0U;
-        auto const old_len = read_buffer_size();
-        auto const read_state = can_read_ != nullptr ? can_read_(this, user_data_, &piece) : READ_ERR;
-        auto const used = old_len - read_buffer_size();
-        auto const overhead = socket_.guess_packet_overhead(used);
+        auto piece = size_t{};
+        auto const read_state = can_read_ != nullptr ? can_read_(this, user_data_, &piece) : ReadState::Err;
 
-        if (piece != 0U)
+        if (piece > 0U)
         {
             bandwidth().notify_bandwidth_consumed(TR_DOWN, piece, true, now);
         }
 
-        if (used != piece)
-        {
-            bandwidth().notify_bandwidth_consumed(TR_DOWN, used - piece, false, now);
-        }
-
-        if (overhead > 0U)
-        {
-            bandwidth().notify_bandwidth_consumed(TR_DOWN, overhead, false, now);
-        }
-
         switch (read_state)
         {
-        case READ_NOW:
-            if (!std::empty(inbuf_))
+        case ReadState::Now:
+        case ReadState::Break:
+            if (std::empty(inbuf_))
             {
-                continue;
+                done = true;
             }
+            break;
 
+        case ReadState::Later:
             done = true;
             break;
 
-        case READ_LATER:
-            done = true;
-            break;
-
-        case READ_ERR:
+        case ReadState::Err:
             err = true;
             break;
         }
@@ -463,7 +451,7 @@ size_t tr_peerIo::try_read(size_t max)
     }
     else if (!std::empty(buf))
     {
-        can_read_wrapper();
+        can_read_wrapper(n_read);
     }
 
     return n_read;
@@ -595,6 +583,29 @@ size_t tr_peerIo::flush_outgoing_protocol_msgs()
     return flush(TR_UP, byte_count);
 }
 
+void tr_peerIo::write_bytes(void const* bytes, size_t n_bytes, bool is_piece_data)
+{
+    if (n_bytes == 0U)
+    {
+        return;
+    }
+
+    outbuf_info_.emplace_back(n_bytes, is_piece_data);
+
+    auto [resbuf, reslen] = outbuf_.reserve_space(n_bytes);
+    filter_.encrypt(reinterpret_cast<std::byte const*>(bytes), n_bytes, resbuf);
+    outbuf_.commit_space(n_bytes);
+
+    session_->queue_session_thread(
+        [ptr = std::weak_ptr{ shared_from_this() }]()
+        {
+            if (auto io = ptr.lock(); io)
+            {
+                io->try_write(SIZE_MAX);
+            }
+        });
+}
+
 // ---
 
 size_t tr_peerIo::get_write_buffer_space(uint64_t now) const noexcept
@@ -610,23 +621,23 @@ void tr_peerIo::read_bytes(void* bytes, size_t n_bytes)
 {
     auto walk = reinterpret_cast<std::byte*>(bytes);
     n_bytes = std::min(n_bytes, std::size(inbuf_));
-    if (decrypt_remain_len_)
+    if (n_decrypt_remain_)
     {
-        if (*decrypt_remain_len_ <= n_bytes)
+        if (auto& n_remain = *n_decrypt_remain_; n_remain <= n_bytes)
         {
-            filter_.decrypt(std::data(inbuf_), *decrypt_remain_len_, walk);
-            inbuf_.drain(*decrypt_remain_len_);
+            filter_.decrypt(std::data(inbuf_), n_remain, walk);
+            inbuf_.drain(n_remain);
             if (walk != nullptr)
             {
-                walk += *decrypt_remain_len_;
+                walk += n_remain;
             }
-            n_bytes -= *decrypt_remain_len_;
+            n_bytes -= n_remain;
             filter_.decrypt_disable();
-            decrypt_remain_len_.reset();
+            n_decrypt_remain_.reset();
         }
         else
         {
-            *decrypt_remain_len_ -= n_bytes;
+            n_remain -= n_bytes;
         }
     }
     filter_.decrypt(std::data(inbuf_), n_bytes, walk);
@@ -656,7 +667,6 @@ void tr_peerIo::on_utp_state_change(int state)
     if (state == UTP_STATE_CONNECT)
     {
         tr_logAddTraceIo(this, "utp_on_state_change -- changed to connected");
-        utp_supported_ = true;
     }
     else if (state == UTP_STATE_WRITABLE)
     {
@@ -736,7 +746,7 @@ void tr_peerIo::utp_init([[maybe_unused]] struct_utp_context* ctx)
 
                 io->inbuf_.add(args->buf, args->len);
                 io->set_enabled(TR_DOWN, true);
-                io->can_read_wrapper();
+                io->can_read_wrapper(args->len);
 
                 // utp_read_drained() notifies libutp that we read a packet from them.
                 // It opens up the congestion window by sending an ACK (soonish) if
@@ -766,19 +776,6 @@ void tr_peerIo::utp_init([[maybe_unused]] struct_utp_context* ctx)
             if (auto* const io = static_cast<tr_peerIo*>(utp_get_userdata(args->socket)); io != nullptr)
             {
                 io->on_utp_error(args->error_code);
-            }
-            return {};
-        });
-
-    utp_set_callback(
-        ctx,
-        UTP_ON_OVERHEAD_STATISTICS,
-        [](utp_callback_arguments* args) -> uint64
-        {
-            if (auto* const io = static_cast<tr_peerIo*>(utp_get_userdata(args->socket)); io != nullptr)
-            {
-                tr_logAddTraceIo(io, fmt::format("{:d} overhead bytes via utp", args->len));
-                io->bandwidth().notify_bandwidth_consumed(args->send != 0 ? TR_UP : TR_DOWN, args->len, false, tr_time_msec());
             }
             return {};
         });
