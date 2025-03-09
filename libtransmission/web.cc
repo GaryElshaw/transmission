@@ -49,10 +49,6 @@
 
 using namespace std::literals;
 
-#if LIBCURL_VERSION_NUM >= 0x070F06 // CURLOPT_SOCKOPT* was added in 7.15.6
-#define USE_LIBCURL_SOCKOPT
-#endif
-
 // ---
 
 namespace
@@ -171,6 +167,22 @@ public:
     explicit Impl(Mediator& mediator_in)
         : mediator{ mediator_in }
     {
+        auto const curl_version_num = get_curl_version();
+        if (curl_version_num == 0x080901)
+        {
+            tr_logAddWarn(_("Consider upgrading your curl installation."));
+            tr_logAddWarn(
+                _("curl 8.9.1 is prone to SIGPIPE crashes. https://github.com/transmission/transmission/issues/7035"));
+        }
+
+        if (curl_version_num == 0x080B01)
+        {
+            tr_logAddWarn(_("Consider upgrading your curl installation."));
+            tr_logAddWarn(
+                _("curl 8.11.1 is prone to an eventfd double close vulnerability that might cause SIGABRT "
+                  "crashes for the transmission-daemon systemd service. https://curl.se/docs/CVE-2025-0665.html"));
+        }
+
         if (auto bundle = tr_env_get_string("CURL_CA_BUNDLE"); !std::empty(bundle))
         {
             curl_ca_bundle = std::move(bundle);
@@ -386,11 +398,24 @@ public:
         CURL* easy_;
     };
 
+    [[nodiscard]] static unsigned int get_curl_version() noexcept
+    {
+        static auto const ver = curl_version_info(CURLVERSION_NOW)->version_num;
+        return ver;
+    }
+
     // https://github.com/curl/curl/issues/10936
     [[nodiscard]] static bool check_curl_gh10936() noexcept
     {
-        auto const version = curl_version_info(CURLVERSION_NOW)->version_num;
-        return version >= 0x075700 /* 7.87.0 */ && version <= 0x080500 /* 8.5.0 */;
+        static bool const in_range = 0x075700 /* 7.87.0 */ <= get_curl_version() && get_curl_version() <= 0x080500 /* 8.5.0 */;
+        return in_range;
+    }
+
+    // https://github.com/curl/curl/issues/6312
+    [[nodiscard]] static bool check_curl_gh6312() noexcept
+    {
+        static bool const in_range = 0x074700 /* 7.71.0 */ <= get_curl_version() && get_curl_version() <= 0x074a00 /* 7.74.0 */;
+        return in_range;
     }
 
     static auto constexpr BandwidthPauseMsec = long{ 500 };
@@ -400,7 +425,7 @@ public:
     bool const curl_verbose = tr_env_key_exists("TR_CURL_VERBOSE");
     bool const curl_ssl_verify = !tr_env_key_exists("TR_CURL_SSL_NO_VERIFY");
     bool const curl_proxy_ssl_verify = !tr_env_key_exists("TR_CURL_PROXY_SSL_NO_VERIFY");
-    bool const curl_gh10936 = check_curl_gh10936();
+    bool const curl_avoid_http2 = check_curl_gh10936() || check_curl_gh6312(); // both related to curl http2 bugs
 
     Mediator& mediator;
 
@@ -497,7 +522,6 @@ public:
         return bytes_used;
     }
 
-#ifdef USE_LIBCURL_SOCKOPT
     static int onSocketCreated(void* vtask, curl_socket_t fd, curlsocktype /*purpose*/)
     {
         auto const* const task = static_cast<Task const*>(vtask);
@@ -518,7 +542,6 @@ public:
         // return nonzero if this function encountered an error
         return 0;
     }
-#endif
 
     void initEasy(Task& task)
     {
@@ -534,11 +557,8 @@ public:
         (void)curl_easy_setopt(e, CURLOPT_NOSIGNAL, 1L);
         (void)curl_easy_setopt(e, CURLOPT_PRIVATE, &task);
         (void)curl_easy_setopt(e, CURLOPT_IPRESOLVE, task.ipProtocol());
-
-#ifdef USE_LIBCURL_SOCKOPT
         (void)curl_easy_setopt(e, CURLOPT_SOCKOPTFUNCTION, onSocketCreated);
         (void)curl_easy_setopt(e, CURLOPT_SOCKOPTDATA, &task);
-#endif
 
         if (!curl_ssl_verify)
         {
@@ -608,7 +628,7 @@ public:
             (void)curl_easy_setopt(e, CURLOPT_RANGE, range->c_str());
         }
 
-        if (curl_gh10936)
+        if (curl_avoid_http2)
         {
             (void)curl_easy_setopt(e, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
         }
